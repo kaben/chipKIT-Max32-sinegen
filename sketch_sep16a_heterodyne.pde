@@ -1,65 +1,104 @@
-#include <math.h>
+/*
+This is a two-channel waveform generator for the Arduino-alike Digilent
+chipKIT Max32 microcontroller, inspired by the following "Hack A Day" post:
+http://hackaday.com/2011/06/08/chipkit-sketch-mini-polyphonic-sampling-synth/
+
+The user can specify two frequencies and amplitudes (i.e. voltage, 5.0v max)
+via serial by typing commands like the following:
+  "1000.0 0.05 2000.0 0.10"
+which specifies a 1kHz 0.05v signal on pin 3, and a 2kHz 0.10v signal on pin 5.
+By default a serial baudrate of 115,200 is used.
+
+This program outputs the two user-specified (co)sine waves on pins 3 and 5,
+with their sum on pin 6 and their difference on pin 9. The outputs are
+pulse-width modulated at a frequency of 312.500 kHz. A low-pass filter must be
+applied to the output signals. The modulating (co)sine signals have a Nyquist
+frequency of about 52 kHz. Minimum frequency is about 0.0002
+
+Frequencies are specified in Hertz with precision of approximately 0.0002 Hz.
+Amplitudes are specified in Volts with precision of approximately 0.04 V.
+
+The wave generator will smoothly transition from old to new frequencies and
+volumes with no discontinuities, which prevents "click" sounds during transition.
+
+Regarding accuracy:
+When I compare a generated 440.0 Hz signal with my 440 Hz tuning fork, agreement
+is within about 0.5 Hz. I think this indicates that my tuning fork is slightly
+out of tune.
+
+Copyright 2013 by Kaben Nanlohy. All rights reserved.
+*/
+
 #include <peripheral/timer.h>
 #include <peripheral/outcompare.h>
 
-#define PWM_1 3 // OC1 PWM output - don't change
-#define PWM_2 5 // OC2 PWM output - don't change
-#define PWM_3 6 // OC3 PWM output - don't change
-#define PWM_4 9 // OC3 PWM output - don't change
-  
-class WaveTable2 {
-public:
-  int resolution, peak, half, len;
-  unsigned int phase[512];
-  char amplitude[512];
-public:
-  WaveTable2(): resolution(256), peak(255), half(128), len(510) {
-    double pi2_inv = 0.5/3.14159265358979323846264338;
-    double step = 2./peak, cosine = 1.;
-    int n = peak-half, i = 0;
-    
-    while (i<resolution) {
-      phase[i] = 1000000000 * acos(cosine) * pi2_inv;
-      amplitude[i] = n;
-      cosine -= step; n--; i++;
-    }
-    while (i<len) {
-      phase[i] = 1000000000 - phase[len-i];
-      amplitude[i] = amplitude[len-i];
-      i++;
-    }
-    phase[510] = 1000000000;
-    amplitude[510] = 127;
-    phase[511] = 2000000000; // dummy value for padding
-    amplitude[511] = 127; // dummy value for padding
-  }
-public:
-  char getAmplitude(unsigned int w) {
-    unsigned int d = 512, i = d;
-    for (; (d); d>>=1){
-      if ((w<=phase[i]) && ((!i) || (phase[i-1]<w))){ break; }
-      if (phase[i]<w) { i += d; }
-      else { i -= d; }
-    }
-    return amplitude[i];
-  }
-  unsigned int dwForFreq(float frequency) {
-    return 1000000000 * frequency * 1024. / F_CPU;
-  }
-  void print() {
-    for (int i=0; i<len; i++) {
-      Serial.print("i: ");
-      Serial.print(i);
-      Serial.print(" w: ");
-      Serial.print(phase[i]);
-      Serial.print(" a: ");
-      Serial.println(amplitude[i], PRINT_DEC);
-    }
-  }
-};
+/* Wave generator parameters. */
+const unsigned int dac_resolution = 256; // Don't change.
+const unsigned int waveform_zero_offset = 128; // Don't change.
+const unsigned int fixed_int_multiplier = 1000000000; // Don't change.
+const unsigned int wavegen_interrupt_period = 768; // Multiple of 256. 768 appears to be minimum.
 
-char getAmplitude2(unsigned int w) {
-  switch (w) {
+/* Output pin assignments. */
+const unsigned int PWM_1 = 3; // OC1 PWM output - don't change
+const unsigned int PWM_2 = 5; // OC2 PWM output - don't change
+const unsigned int PWM_3 = 6; // OC3 PWM output - don't change
+const unsigned int PWM_4 = 9; // OC3 PWM output - don't change
+const unsigned int LED_PIN = 13; // On-board LED - don't change
+
+/* Frequency state. */
+float f0 = 1000., f1 = 1000.;
+
+/* Phase state. */
+unsigned int w0 = 0, w1 = 0;
+// Target phase differentials corresponding to above frequencies.
+unsigned int dw0_tgt = dw_for_freq(f0), dw1_tgt = dw_for_freq(f1);
+// Actual phase differentials.
+unsigned int dw0 = 0, dw1 = 0;
+// Phase "second-differentials" for gradual frequency adjustment.
+unsigned int ddw = fixed_int_multiplier/(2*dac_resolution);
+
+/* Volume state. */
+// Target volumes.
+float v0_tgt = 1., v1_tgt = 1.;
+// Actual volumes.
+float v0 = 0., v1 = 0.;
+// Differential for gradual volume adjustment.
+float dv = 0.5/dac_resolution;
+
+/* LED "alive" blinkage state. */
+const unsigned long blink_period_ms = 500;
+unsigned long next_blink_time = 0;
+unsigned int led_state = 0;
+
+/* Serial I/O bitrate. */
+const unsigned int serial_baud = 115200;
+
+
+/*
+Function to compute required phase differential to generate given frequency.
+*/
+unsigned int dw_for_freq(float frequency) {
+  return frequency * fixed_int_multiplier * wavegen_interrupt_period / F_CPU;
+}
+
+/*
+Function to compute cosine wave amplitude at given normalized phase.
+
+Normalized phase takes values from zero to one,
+in fixed-point representation with 1,000,000,000 fixed-point multiplier.
+This corresponds to unnormalized phase from zero to 2*pi.
+The giant switch/case statement was generated with a Python script.
+The Python script was pretty simple: it computed w=acos(c)
+for c in the interval [-1, 1], with the interval sliced into 256 parts,
+which gave the first half of the cosine wave. The second half was a reflection
+of the first half, with corresponding w offset by pi. This gave corresponding
+pairs of phase and amplitude in the form (w, c). The phase values were normalized
+to the interval [0, 1,000,000,000], and the amplitude values were normalized to
+the interval [-128, 127]. These normalized numbers were used to construct the
+case labels for the switch statement.
+*/
+char cosine_amplitude(unsigned int phase) {
+  switch (phase) {
   case 0 ... 19946388: return 127;
   case 19946389 ... 28226976: return 126;
   case 28226977 ... 34593611: return 125;
@@ -574,172 +613,107 @@ char getAmplitude2(unsigned int w) {
   }
 }
 
-
-WaveTable2 wave_tbl;
-// Frequency
-float f0 = 0., f1 = 0.;
-float f0_tgt = 0., f1_tgt = 0.;
-// Volume
-float v0 = 0., v1 = 0.;
-float v0_tgt = 0., v1_tgt = 0.; // Target volumes
-float dv = 0.;
-// Phase
-unsigned int w0 = 0, w1 = 0;
-unsigned int dw0_tgt = 0, dw1_tgt = 0; 
-unsigned int dw0 = 0, dw1 = 0;
-unsigned int ddw = 0;
-
-void reportParams() {
+void report_params() {
   Serial.print("f0: ");
   Serial.print(f0);
-  Serial.print(" f0_tgt: ");
-  Serial.print(f0_tgt);
-  Serial.print(" v0: ");
-  Serial.print(v0);
-  Serial.print(" v0_tgt: ");
-  Serial.print(v0_tgt);
-  Serial.print(" w0: ");
-  Serial.print(w0);
-  Serial.print(" dw0: ");
-  Serial.print(dw0);
-  Serial.print(" dw0_tgt: ");
+  Serial.print(", v0_tgt: ");
+  Serial.print(5.*v0_tgt);  // Amplitudes are normalized to 1.0 max, which corresponds to 5.0v.
+  Serial.print(", dw0_tgt: ");
   Serial.println(dw0_tgt);
   Serial.flush();
 
   Serial.print("f1: ");
   Serial.print(f1);
-  Serial.print(" f1_tgt: ");
-  Serial.print(f1_tgt);
-  Serial.print(" v1: ");
-  Serial.print(v1);
-  Serial.print(" v1_tgt: ");
-  Serial.print(v1_tgt);
-  Serial.print(" w1: ");
-  Serial.print(w1);
-  Serial.print(" dw1: ");
-  Serial.print(dw1);
-  Serial.print(" dw1_tgt: ");
+  Serial.print(", v1_tgt: ");
+  Serial.print(5.*v1_tgt);
+  Serial.print(", dw1_tgt: ");
   Serial.println(dw1_tgt);
-  Serial.flush();
-
-  Serial.print("dv: ");
-  Serial.print(dv);
-  Serial.print(" ddw: ");
-  Serial.println(ddw);
   Serial.flush();
 }
 
 void setup() {
-  // Frequency
-  f0 = 1000., f1 = 1000.;
-  f0_tgt = 1000., f1_tgt = 1000.;
-  // Volume
-  v0 = 0., v1 = 0.;
-  v0_tgt = 1., v1_tgt = 1.; // Target volumes
-  dv = 0.5/wave_tbl.resolution;
-  // Phase
-  w0 = 0., w1 = 0.;
-  dw0_tgt = wave_tbl.dwForFreq(f0), dw1_tgt = wave_tbl.dwForFreq(f1); 
-  dw0 = 0., dw1 = 0.;
-  ddw = 1000000000/(2*wave_tbl.resolution);
-
-  pinMode(PWM_1, OUTPUT); // Enable PWM output pin 3
-  pinMode(PWM_2, OUTPUT); // Enable PWM output pin 5
-  pinMode(PWM_3, OUTPUT); // Enable PWM output pin 6
-  pinMode(PWM_4, OUTPUT); // Enable PWM output pin 9
-  pinMode(13, OUTPUT); // LED
-  
+  // Setup output pins.
+  pinMode(PWM_1, OUTPUT); // Enable PWM output pin 3. Outputs channel a sine wave.
+  pinMode(PWM_2, OUTPUT); // Enable PWM output pin 5. Outputs channel b sine wave
+  pinMode(PWM_3, OUTPUT); // Enable PWM output pin 6. Outputs a+b.
+  pinMode(PWM_4, OUTPUT); // Enable PWM output pin 9. Outputs a-b.
+  pinMode(LED_PIN, OUTPUT); // Enable output on LED pin 13. For "alive" blinkage.
+  // Setup high-speed PWM on timer 2 and PWM_1-4 pins.
   OpenTimer2(T2_ON | T2_PS_1_1, 256);
   OpenOC1(OC_ON | OC_TIMER2_SRC | OC_PWM_FAULT_PIN_DISABLE, 0, 0);
   OpenOC2(OC_ON | OC_TIMER2_SRC | OC_PWM_FAULT_PIN_DISABLE, 0, 0);
   OpenOC3(OC_ON | OC_TIMER2_SRC | OC_PWM_FAULT_PIN_DISABLE, 0, 0);
   OpenOC4(OC_ON | OC_TIMER2_SRC | OC_PWM_FAULT_PIN_DISABLE, 0, 0);
-
+  // Setup waveform generation.
   ConfigIntTimer1(T1_INT_ON | T1_INT_PRIOR_3);
-  OpenTimer1(T1_ON | T2_PS_1_1, 1024);
+  OpenTimer1(T1_ON | T2_PS_1_1, wavegen_interrupt_period);
+  // Open serial port.
+  Serial.begin(serial_baud);
 
-  Serial.begin(115200);
-  reportParams();
-  wave_tbl.print();
-  Serial.println("From table:");
-  for (unsigned int w=0; w<=1000000000; w+=5000000) {
-    char a = wave_tbl.getAmplitude(w);
-    Serial.print("w: ");
-    Serial.print(" a: ");
-    Serial.println(a, PRINT_DEC);
-  }
-  Serial.println("From switch:");
-  for (unsigned int w=0; w<=1000000000; w+=5000000) {
-    char a = getAmplitude2(w);
-    Serial.print("w: ");
-    Serial.print(" a: ");
-    Serial.println(a, PRINT_DEC);
-  }
+  report_params();
 }
 
-unsigned long next_blink_time = 0;
-unsigned int led_state = 0;
+/*
+Main loop in non-interrupt thread.
+Blinks "alive" LED,
+checks for new user-requested frequencies and volumes,
+and gradually adjusts actual frequencies and volumes to match request.
+*/
 void loop() {
+  // LED "alive" blinkage.
   unsigned long now = millis();
   if (next_blink_time < now) {
-    next_blink_time += 500;
+    next_blink_time += blink_period_ms;
+    // Toggle LED.
     if (led_state) { led_state = 0; }
     else { led_state = 1; }
-    digitalWrite(13, led_state);
+    digitalWrite(LED_PIN, led_state);
   }
+  // Check for new user-requested frequencies and volumes.
   if (Serial.available() > 0) {
-    f0_tgt = Serial.parseFloat();
-    v0_tgt = Serial.parseFloat();
-    f1_tgt = Serial.parseFloat();
-    v1_tgt = Serial.parseFloat();
-
-    // Frequency
-    if (f0_tgt != f0) {
-      dw0_tgt = wave_tbl.dwForFreq(f0_tgt);
-      f0 = f0_tgt;
-    }
-    if (f1_tgt != f1) {
-      dw1_tgt = wave_tbl.dwForFreq(f1_tgt);
-      f1 = f1_tgt;
-    }
-  
-    reportParams();
+    f0 = Serial.parseFloat(); // Signal 'a' frequency.
+    // Amplitudes are normalized to 1.0 max, which corresponds to 5.0v.
+    v0_tgt = Serial.parseFloat()/5.; // Signal 'a' volume.
+    f1 = Serial.parseFloat(); // Signal 'b' frequency.
+    v1_tgt = Serial.parseFloat()/5.; // Signal 'b' volume.
+    // Determine target phase differential to generate requested frequencies.
+    dw0_tgt = dw_for_freq(f0); // Signal 'a' phase differential for requested frequency.
+    dw1_tgt = dw_for_freq(f1); // Signal 'b' phase differential for requested frequency.
+    
+    report_params();
   }
-  // Volume
-  if (1e-6 < v0_tgt - v0) { v0 += fminf(dv, v0_tgt - v0); }
-  else if (1e-6 < v0 - v0_tgt) { v0 -= fminf(dv, v0 - v0_tgt); }
+  // Gradually adjust actual volumes to match targets.
+  if (1e-9 < v0_tgt - v0) { v0 += fminf(dv, v0_tgt - v0); }
+  else if (1e-9 < v0 - v0_tgt) { v0 -= fminf(dv, v0 - v0_tgt); }
   else { v0 = v0_tgt; }
-
-  if (1e-6 < v1_tgt - v1) { v1 += fminf(dv, v1_tgt - v1); }
-  else if (1e-6 < v1 - v1_tgt) { v1 -= fminf(dv, v1 - v1_tgt); }
+  if (1e-9 < v1_tgt - v1) { v1 += fminf(dv, v1_tgt - v1); }
+  else if (1e-9 < v1 - v1_tgt) { v1 -= fminf(dv, v1 - v1_tgt); }
   else { v1 = v1_tgt; }
-
-  // Phase
+  // By adjusting phase differentials, gradually adjust actual frequencies to match targets.
   if (dw0 < dw0_tgt) { dw0 += min(ddw, dw0_tgt - dw0); }
   else if (dw0_tgt < dw0) { dw0 -= min(ddw, dw0 - dw0_tgt); }
-
   if (dw1 < dw1_tgt) { dw1 += min(ddw, dw1_tgt - dw1); }
   else if (dw1_tgt < dw1) { dw1 -= min(ddw, dw1 - dw1_tgt); }
 }
 
+/* Interrupt handler to generate waveform. */
 extern "C" {
-void __ISR(_TIMER_1_VECTOR,ipl3) waveGen(void) {
+void __ISR(_TIMER_1_VECTOR,ipl3) wavegen(void) {
   int n0, n1, np, nm;
-
   mT1ClearIntFlag();
-  
-  w0 = (w0 + dw0) % 1000000000;
-  w1 = (w1 + dw1) % 1000000000;
-//  n0 = v0*wave_tbl.getAmplitude(w0);
-//  n1 = v1*wave_tbl.getAmplitude(w1);
-  n0 = v0*getAmplitude2(w0);
-  n1 = v1*getAmplitude2(w1);
+  // Adjust wave phases.
+  w0 = (w0 + dw0) % fixed_int_multiplier;
+  w1 = (w1 + dw1) % fixed_int_multiplier;
+  // Adjust waveform amplitudes at adjusted phases.
+  n0 = v0*cosine_amplitude(w0);
+  n1 = v1*cosine_amplitude(w1);
+  // Compute sum and difference signals.
   np = (n0 + n1 + 1) >> 1;
   nm = (n0 - n1 + 1) >> 1;
-
-  SetDCOC1PWM(n0 + wave_tbl.half);
-  SetDCOC2PWM(n1 + wave_tbl.half);
-  SetDCOC3PWM(np + wave_tbl.half);
-  SetDCOC4PWM(nm + wave_tbl.half);
+  // Update PWM signals.
+  SetDCOC1PWM(n0 + waveform_zero_offset);
+  SetDCOC2PWM(n1 + waveform_zero_offset);
+  SetDCOC3PWM(np + waveform_zero_offset);
+  SetDCOC4PWM(nm + waveform_zero_offset);
 }
 }
